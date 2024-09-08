@@ -1,11 +1,12 @@
 import os
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from langchain.chat_models import ChatOpenAI
-from langchain.agents import AgentType, initialize_agent, Tool
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
-from langchain.utilities import GoogleSerperAPIWrapper
-from typing import List, Dict, Any
+from typing import Dict, Any
 import uuid
 
 # Load environment variables
@@ -13,107 +14,86 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Initialize the LLM with `gpt-3.5-turbo` using ChatOpenAI
-llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7)
+# Initialize the LLM
+llm = ChatOpenAI(model="gpt-4", temperature=0)
 
-# Initialize Serper API Wrapper for web search
-search = GoogleSerperAPIWrapper()
+# Initialize Tavily Search tool
+tavily_search = TavilySearchResults(max_results=3)
 
-# In-memory storage for task types, agent types, tasks, agents, and assignments
-task_types: Dict[str, str] = {}  # Task type name to description
-agent_types: Dict[str, List[str]] = {}  # Agent type name to tools
+# In-memory storage for tasks, agents, and assignments
 tasks: Dict[str, 'Task'] = {}
 agents: Dict[str, 'Agent'] = {}
-assignments: Dict[str, Dict[str, Any]] = {}  # {task_id: {agent_name, assigned: bool}}
-
-# Tool functions
-def web_search(query: str) -> str:
-    return search.run(query)
+assignments: Dict[str, Dict[str, Any]] = {}
 
 # Task class
 class Task:
-    def __init__(self, name: str, description: str, task_type: str):
+    def __init__(self, name: str, description: str):
         self.id = str(uuid.uuid4())
         self.name = name
         self.description = description
-        self.task_type = task_type
         self.result = None
 
     def execute(self, agent, **kwargs):
-        # Construct a more specific prompt
-        task_prompt = f"Complete the following task: {self.name}\n{self.description}\n\nUse the following information:\n"
+        task_prompt = f"Complete the following task: {self.name}\n{self.description}\n\nAdditional Information:\n"
         for key, value in kwargs.items():
             task_prompt += f"{key}: {value}\n"
-        
-        # Add explicit instruction to format the output correctly
-        task_prompt += "\nPlease provide your response in a clear and concise format, indicating any tools used and the final output.\n"
-
-        # Execute the task
-        self.result = agent.run(task_prompt)
+        self.result = agent.process_task(task_prompt)
         return self.result
 
 # Agent class
 class Agent:
-    def __init__(self, name: str, llm, agent_type: str, memory=None, tools=None):
+    def __init__(self, name: str):
         self.name = name
-        self.llm = llm
-        self.agent_type = agent_type
-        self.memory = memory
-        self.tools = tools if tools else []
-        self.agent = initialize_agent(
-            self.tools,
-            llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=True,
-            memory=memory
-        )
+        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        self.tools = [tavily_search]
+        self.agent_executor = self._create_agent()
+
+    def _create_agent(self):
+        template = '''Answer the following questions as best you can. You have access to the following tools:
+
+{tools}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}'''
+
+        prompt = PromptTemplate.from_template(template)
+        
+        agent = create_react_agent(llm, self.tools, prompt)
+        return AgentExecutor(agent=agent, tools=self.tools, verbose=True, memory=self.memory)
+
+    def process_task(self, task_prompt: str) -> str:
+        response = self.agent_executor.invoke({"input": task_prompt})
+        return response['output']
 
     def execute_task(self, task: Task, **kwargs):
-        return task.execute(self.agent, **kwargs)
+        return task.execute(self, **kwargs)
 
 # Flask API routes
 
-@app.route('/define_task_type', methods=['POST'])
-def define_task_type():
-    """Define a new task type."""
-    data = request.json
-    task_type = data.get('task_type')
-    description = data.get('description', 'No description provided.')
-    
-    if not task_type:
-        return jsonify({"error": "Task type is required"}), 400
-
-    task_types[task_type] = description
-    return jsonify({"message": f"Task type '{task_type}' defined."}), 201
-
-@app.route('/define_agent_type', methods=['POST'])
-def define_agent_type():
-    """Define a new agent type with specific tools."""
-    data = request.json
-    agent_type = data.get('agent_type')
-    tools = data.get('tools', [])
-
-    if not agent_type:
-        return jsonify({"error": "Agent type is required"}), 400
-
-    agent_types[agent_type] = tools
-    return jsonify({"message": f"Agent type '{agent_type}' defined."}), 201
-
 @app.route('/add_task', methods=['POST'])
 def add_task():
-    """Add a new generic task that can be executed multiple times with different parameters."""
+    """Add a new task."""
     data = request.json
     name = data.get('name')
     description = data.get('description')
-    task_type = data.get('task_type')
     
-    if not name or not description or not task_type:
-        return jsonify({"error": "Task name, description, and type are required"}), 400
+    if not name or not description:
+        return jsonify({"error": "Task name and description are required"}), 400
 
-    if task_type not in task_types:
-        return jsonify({"error": "Task type not defined"}), 400
-
-    task = Task(name=name, description=description, task_type=task_type)
+    task = Task(name=name, description=description)
     tasks[task.id] = task
     return jsonify({"task_id": task.id}), 201
 
@@ -122,24 +102,11 @@ def add_agent():
     """Add a new agent."""
     data = request.json
     name = data.get('name')
-    agent_type = data.get('agent_type')
     
-    if not name or not agent_type:
-        return jsonify({"error": "Agent name and type are required"}), 400
+    if not name:
+        return jsonify({"error": "Agent name is required"}), 400
 
-    if agent_type not in agent_types:
-        return jsonify({"error": "Agent type not defined"}), 400
-
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-
-    # Initialize tools based on the agent type
-    tools = []
-    for tool_name in agent_types[agent_type]:
-        if tool_name == 'Web Search':
-            tools.append(Tool(name="Web Search", func=web_search, description="Tool to perform web searches."))
-        # Add other tools as needed
-
-    agent = Agent(name=name, llm=llm, agent_type=agent_type, memory=memory, tools=tools)
+    agent = Agent(name=name)
     agents[name] = agent
     return jsonify({"agent_name": agent.name}), 201
 
@@ -156,7 +123,6 @@ def assign_task():
     if not agent or not task:
         return jsonify({"error": "Agent or task not found"}), 404
 
-    # Assign task to agent
     assignments[task_id] = {"agent_name": agent_name, "assigned": True}
     return jsonify({"message": f"Task '{task_id}' assigned to agent '{agent_name}'."}), 200
 
@@ -178,7 +144,6 @@ def execute_task():
 
     result = agent.execute_task(task, **additional_data)
 
-    # Allow re-execution of the same task with different parameters
     return jsonify({"result": result})
 
 @app.route('/get_agents', methods=['GET'])
@@ -189,17 +154,7 @@ def get_agents():
 @app.route('/get_tasks', methods=['GET'])
 def get_tasks():
     """Get all tasks."""
-    return jsonify({"tasks": list(tasks.keys())})
-
-@app.route('/get_task_types', methods=['GET'])
-def get_task_types():
-    """Get all defined task types."""
-    return jsonify({"task_types": task_types})
-
-@app.route('/get_agent_types', methods=['GET'])
-def get_agent_types():
-    """Get all defined agent types."""
-    return jsonify({"agent_types": agent_types})
+    return jsonify({"tasks": {task_id: {"name": task.name, "description": task.description} for task_id, task in tasks.items()}})
 
 @app.route('/get_assignments', methods=['GET'])
 def get_assignments():
@@ -207,9 +162,4 @@ def get_assignments():
     return jsonify({"assignments": assignments})
 
 if __name__ == '__main__':
-    # Adding sample task types and agent types for demonstration
-    task_types['Market Research'] = 'Research market trends and analyze competitor data.'
-    agent_types['Research Agent'] = ['Web Search', 'Data Analysis']
-
-    # Running the Flask app
     app.run(debug=True)
